@@ -1,0 +1,13 @@
+{
+  "name": "family-calendar-telegram-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram bot that turns text or voice notes into Google Calendar family events.",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "check": "node --check src/index.mjs",
+    "check:config": "node src/check-config.mjs"
+  }
+}

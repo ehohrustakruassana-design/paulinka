@@ -1,0 +1,9 @@
+.env
+.git
+.gitignore
+.gcloudignore
+data
+tmp
+node_modules
+service-account.json
+README.md

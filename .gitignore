@@ -1,0 +1,8 @@
+.env
+service-account.json
+data/
+tmp/
+node_modules/
+.DS_Store
+
+._*

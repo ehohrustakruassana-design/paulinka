@@ -1,0 +1,7 @@
+.env
+service-account.json
+data/
+tmp/
+node_modules/
+.git
+.gitignore
