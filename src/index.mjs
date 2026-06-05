@@ -19,7 +19,8 @@ const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 
 let state = {
   lastUpdateId: 0,
-  pendingClarifications: {}
+  pendingClarifications: {},
+  lastCreatedByChat: {}
 };
 
 async function main() {
@@ -113,12 +114,14 @@ async function loadState() {
     const parsed = JSON.parse(raw);
     return {
       lastUpdateId: parsed.lastUpdateId || 0,
-      pendingClarifications: parsed.pendingClarifications || {}
+      pendingClarifications: parsed.pendingClarifications || {},
+      lastCreatedByChat: parsed.lastCreatedByChat || {}
     };
   } catch {
     return {
       lastUpdateId: 0,
-      pendingClarifications: {}
+      pendingClarifications: {},
+      lastCreatedByChat: {}
     };
   }
 }
@@ -236,7 +239,7 @@ async function getTelegramUpdates(offset) {
     body: JSON.stringify({
       offset,
       timeout: 50,
-      allowed_updates: ["message"]
+      allowed_updates: ["message", "callback_query"]
     })
   });
 
@@ -255,7 +258,7 @@ async function ensureTelegramWebhook() {
     body: JSON.stringify({
       url: webhookUrl,
       secret_token: CONFIG.telegramWebhookSecret || undefined,
-      allowed_updates: ["message"]
+      allowed_updates: ["message", "callback_query"]
     })
   });
 
@@ -267,6 +270,11 @@ async function ensureTelegramWebhook() {
 }
 
 async function handleUpdate(update) {
+  if (update.callback_query?.message?.chat?.id) {
+    await handleCallbackQuery(update.callback_query);
+    return;
+  }
+
   const message = update.message;
   if (!message?.chat?.id) {
     return;
@@ -275,23 +283,37 @@ async function handleUpdate(update) {
   const chatId = String(message.chat.id);
 
   try {
-    if (message.text === "/start" || message.text === "/help") {
+    const command = getTelegramCommand(message.text || "");
+
+    if (command === "/start" || command === "/help") {
       await sendTelegramMessage(
         chatId,
-        [
-          "Присылай событие текстом или голосом.",
-          "Примеры:",
-          "10 июня пикник в садике в 15:00",
-          "22 июня балет, гала, в 16:30",
-          "Можно по-русски или по-польски."
-        ].join("\n")
+        "Пиши или говори событие. Я добавлю его в семейный календарь.\n\nПример: 10 июня пикник в садике в 15:00"
       );
+      return;
+    }
+
+    if (command === "/cancel") {
+      if (clearPendingClarification(chatId)) {
+        await saveState();
+      }
+      await sendTelegramMessage(chatId, "Ок, отменил.");
+      return;
+    }
+
+    if (command === "/calendar") {
+      await sendTelegramMessage(chatId, `Семейный календарь: ${buildCalendarUrl()}`);
+      return;
+    }
+
+    if (command === "/undo") {
+      await undoLastCreatedEvents(chatId);
       return;
     }
 
     const extractedText = await extractMessageText(message);
     if (!extractedText?.trim()) {
-      await sendTelegramMessage(chatId, "Не вижу текста события. Пришли текст или голосовое сообщение.");
+      await sendTelegramMessage(chatId, "Не вижу событие. Пришли текст или голосовое.");
       return;
     }
 
@@ -310,7 +332,7 @@ async function handleUpdate(update) {
       await saveState();
       await sendTelegramMessage(
         chatId,
-        parsed.clarification_question || "Уточни, пожалуйста, дату или время события.",
+        parsed.clarification_question || "Уточни дату или время.",
         {
           reply_markup: {
             force_reply: true,
@@ -321,11 +343,11 @@ async function handleUpdate(update) {
       return;
     }
 
-    delete state.pendingClarifications[chatId];
+    clearPendingClarification(chatId);
     await saveState();
 
     if (!Array.isArray(parsed.events) || parsed.events.length === 0) {
-      await sendTelegramMessage(chatId, "Не смог понять событие. Попробуй написать его короче: дата, время, что это.");
+      await sendTelegramMessage(chatId, "Не поняла. Попробуй короче: дата, время, что это.");
       return;
     }
 
@@ -347,29 +369,132 @@ async function handleUpdate(update) {
       created.push(createdEvent);
     }
 
-    const lines = [];
     if (created.length > 0) {
-      lines.push("Добавил в календарь `Семья`:");
-      for (const event of created) {
-        lines.push(`- ${event.summary}: ${formatEventSummary(event)}`);
-      }
-    }
-    if (skipped.length > 0) {
-      if (lines.length > 0) lines.push("");
-      lines.push(...skipped);
-    }
-    if (lines.length === 0) {
-      lines.push("Новых событий не добавил.");
+      rememberLastCreatedEvents(chatId, created);
+      await saveState();
     }
 
-    await sendTelegramMessage(chatId, lines.join("\n"));
+    await sendTelegramMessage(chatId, formatCreateResultMessage(created, skipped), buildPostCreateReplyMarkup(created));
   } catch (error) {
     console.error("Update handling error:", error);
     await sendTelegramMessage(
       chatId,
-      "Не получилось обработать сообщение. Проверь, пожалуйста, что в нём есть дата и событие. Если это голосовое, ещё нужен ffmpeg на сервере."
+      "Не получилось обработать. Проверь, что есть дата и событие."
     ).catch(() => {});
   }
+}
+
+async function handleCallbackQuery(callbackQuery) {
+  const chatId = String(callbackQuery.message.chat.id);
+  const data = callbackQuery.data || "";
+
+  try {
+    if (data === "undo_last") {
+      await undoLastCreatedEvents(chatId, callbackQuery.id);
+      if (callbackQuery.message?.message_id) {
+        await editTelegramReplyMarkup(chatId, callbackQuery.message.message_id, { inline_keyboard: [] }).catch(() => {});
+      }
+      return;
+    }
+
+    await answerTelegramCallbackQuery(callbackQuery.id, "Не поняла действие.");
+  } catch (error) {
+    console.error("Callback handling error:", error);
+    await answerTelegramCallbackQuery(callbackQuery.id, "Не получилось.");
+  }
+}
+
+function getTelegramCommand(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed.startsWith("/")) {
+    return "";
+  }
+
+  return trimmed.split(/\s+/, 1)[0].split("@", 1)[0].toLowerCase();
+}
+
+function clearPendingClarification(chatId) {
+  if (!state.pendingClarifications[chatId]) {
+    return false;
+  }
+
+  delete state.pendingClarifications[chatId];
+  return true;
+}
+
+function rememberLastCreatedEvents(chatId, events) {
+  state.lastCreatedByChat[chatId] = {
+    eventIds: events.map((event) => event.id).filter(Boolean),
+    summaries: events.map((event) => `${event.summary}: ${formatEventSummary(event)}`),
+    createdAt: new Date().toISOString()
+  };
+}
+
+function buildCalendarUrl() {
+  return `https://calendar.google.com/calendar/u/0?cid=${encodeURIComponent(CONFIG.googleCalendarId)}`;
+}
+
+function formatCreateResultMessage(created, skipped) {
+  const lines = [];
+
+  if (created.length === 1) {
+    lines.push(`Добавил: ${created[0].summary}, ${formatEventSummary(created[0])}`);
+  } else if (created.length > 1) {
+    lines.push("Добавил:");
+    for (const event of created) {
+      lines.push(`- ${event.summary}: ${formatEventSummary(event)}`);
+    }
+  }
+
+  if (skipped.length > 0) {
+    if (lines.length === 0) {
+      lines.push("Похоже, это уже есть.");
+    } else {
+      lines.push("Часть событий уже была в календаре.");
+    }
+  }
+
+  if (lines.length === 0) {
+    lines.push("Ничего нового не добавил.");
+  }
+
+  return lines.join("\n");
+}
+
+function buildPostCreateReplyMarkup(created) {
+  if (created.length === 0) {
+    return {};
+  }
+
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: "Отменить", callback_data: "undo_last" }]]
+    }
+  };
+}
+
+async function undoLastCreatedEvents(chatId, callbackQueryId = "") {
+  const lastCreated = state.lastCreatedByChat[chatId];
+
+  if (!lastCreated?.eventIds?.length) {
+    if (callbackQueryId) {
+      await answerTelegramCallbackQuery(callbackQueryId, "Нечего отменять.");
+    }
+    await sendTelegramMessage(chatId, "Нечего отменять.");
+    return;
+  }
+
+  for (const eventId of lastCreated.eventIds) {
+    await deleteCalendarEvent(eventId);
+  }
+
+  delete state.lastCreatedByChat[chatId];
+  await saveState();
+
+  if (callbackQueryId) {
+    await answerTelegramCallbackQuery(callbackQueryId, "Отменил.");
+  }
+  await sendTelegramMessage(chatId, "Ок, удалила последнее событие.");
 }
 
 function buildClarificationPrompt(originalInput, reply) {
@@ -762,6 +887,24 @@ async function createCalendarEvent(event) {
   return response;
 }
 
+async function deleteCalendarEvent(eventId) {
+  const accessToken = await getGoogleAccessToken();
+
+  const response = await fetch(
+    `${GOOGLE_CALENDAR_API}/calendars/${encodeURIComponent(CONFIG.googleCalendarId)}/events/${encodeURIComponent(eventId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`Google Calendar delete failed: ${response.status} ${await response.text()}`);
+  }
+}
+
 async function findDuplicateEvent(event) {
   const accessToken = await getGoogleAccessToken();
   const { timeMin, timeMax } = buildSearchWindow(event);
@@ -933,6 +1076,37 @@ async function sendTelegramMessage(chatId, text, extra = {}) {
 
   if (!response.ok) {
     throw new Error(`Telegram sendMessage failed: ${JSON.stringify(response)}`);
+  }
+}
+
+async function answerTelegramCallbackQuery(callbackQueryId, text = "") {
+  const response = await fetchJson(`${TELEGRAM_API}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      text
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram answerCallbackQuery failed: ${JSON.stringify(response)}`);
+  }
+}
+
+async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
+  const response = await fetchJson(`${TELEGRAM_API}/editMessageReplyMarkup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: Number(chatId),
+      message_id: Number(messageId),
+      reply_markup: replyMarkup
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram editMessageReplyMarkup failed: ${JSON.stringify(response)}`);
   }
 }
 
