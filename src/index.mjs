@@ -444,6 +444,7 @@ async function downloadTelegramFile(fileId, hintedMimeType = "") {
 
 async function prepareAudioForTranscription(downloaded) {
   const ext = path.extname(downloaded.localPath).toLowerCase();
+  const requiresConversion = new Set([".oga", ".opus"]);
   const supported = new Map([
     [".mp3", "audio/mpeg"],
     [".mp4", "audio/mp4"],
@@ -453,15 +454,13 @@ async function prepareAudioForTranscription(downloaded) {
     [".aac", "audio/aac"],
     [".flac", "audio/flac"],
     [".ogg", "audio/ogg"],
-    [".oga", "audio/ogg"],
-    [".opus", "audio/ogg"],
     [".wav", "audio/wav"],
     [".webm", "audio/webm"]
   ]);
 
   const mimeType = supported.get(ext) || normalizeSupportedAudioMimeType(downloaded.sourceMimeType);
 
-  if (mimeType) {
+  if (mimeType && !requiresConversion.has(ext)) {
     return {
       buffer: await fs.readFile(downloaded.localPath),
       filename: path.basename(downloaded.localPath),
