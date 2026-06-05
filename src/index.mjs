@@ -642,12 +642,31 @@ async function extractEventsWithOpenAI(inputText) {
   }
 
   const json = await response.json();
-  const outputText = json.output_text;
+  const outputText = extractResponseText(json);
   if (!outputText) {
     throw new Error(`OpenAI response missing output_text: ${JSON.stringify(json)}`);
   }
 
   return JSON.parse(outputText);
+}
+
+
+function extractResponseText(responseJson) {
+  if (typeof responseJson?.output_text === "string" && responseJson.output_text.trim()) {
+    return responseJson.output_text.trim();
+  }
+
+  const parts = [];
+
+  for (const item of responseJson?.output || []) {
+    for (const content of item?.content || []) {
+      if (typeof content?.text === "string" && content.text.trim()) {
+        parts.push(content.text.trim());
+      }
+    }
+  }
+
+  return parts.join("\n").trim();
 }
 
 function normalizeEvent(event) {
